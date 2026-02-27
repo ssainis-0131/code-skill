@@ -14,7 +14,7 @@ This extension provides language support (syntax highlighting, snippets, themes,
 
 However, several areas of concern were identified across supply chain integrity, regex-based denial-of-service, information disclosure, external resource trust, and a critical discrepancy between advertised features and shipped code.
 
-**Overall Risk Rating: LOW-MODERATE**
+**Overall Risk Rating: MODERATE-HIGH** (elevated due to obfuscated code in published VSIX)
 
 ---
 
@@ -51,6 +51,98 @@ However, `package.json` has **no `main` or `browser` field**, and **no JavaScrip
 - Obtain and audit the actual `.vsix` package from the Marketplace.
 - Compare its contents against this repository to identify any bundled JavaScript/TypeScript that is not source-available.
 - Do not trust this repository as a complete representation of the published extension without verification.
+
+---
+
+### 2.1.1 CRITICAL — VSIX Audit Results (Performed February 26, 2026)
+
+The published VSIX (v0.10.0) was downloaded and extracted. **The findings confirm that the published extension contains significant code not present in this repository, and that code is intentionally obfuscated.**
+
+#### Structure Differences
+
+The published VSIX uses a **client-server Language Server Protocol (LSP) architecture** with the following files absent from the repository:
+
+| File | Size | Description |
+|---|---|---|
+| `client/out/extension.js` | **1,647,979 bytes** (1.6 MB) | Main extension entry point — **obfuscated** |
+| `server/out/server.js` | **356,321 bytes** (356 KB) | Language server — **obfuscated** |
+| `client/package.json` | 600 bytes | Declares dependency on `vscode-languageclient ^9.0.1` |
+| `server/package.json` | 449 bytes | Declares dependency on `vscode-languageserver ^9.0.1` |
+| `client/syntaxes/skill.tmLanguage.json` | 29,106 bytes | JSON grammar (repo has plist XML format) |
+| `client/themes/light_modern.json` | 6,015 bytes | Light theme not in repo |
+| `client/themes/light_plus.json` | 4,907 bytes | Light theme not in repo |
+| `client/themes/light_vs.json` | 9,128 bytes | Light theme not in repo |
+| `client/themes/skill_light_modern.json` | 996 bytes | Light SKILL theme not in repo |
+
+#### Key Differences in VSIX `package.json` vs. Repository `package.json`
+
+| Property | Repository | Published VSIX |
+|---|---|---|
+| `version` | `0.5.0` | `0.10.0` |
+| `engines.vscode` | `^1.0.0` | `^1.75.0` |
+| `main` | **(missing)** | `./client/out/extension` |
+| `activationEvents` | **(missing)** | `["onLanguage:Skill"]` |
+| `capabilities` | **(missing)** | `{"definitionProvider": "true"}` |
+| `file extensions` | `.ocn, .il, .ils` | `.il, .ils, .ocn, .cst, .csf` |
+| `configuration` (settings) | **(missing)** | Full `skill.completion.*` and `skill.diagnostic.*` settings |
+| Build scripts | **(missing)** | TypeScript → webpack → **`javascript-obfuscator`** |
+
+#### Intentional Code Obfuscation
+
+The VSIX `package.json` contains these build scripts:
+
+```json
+"vscode:prepublish": "npm run webpack && npm run obfuscator",
+"obfuscator": "javascript-obfuscator ./client/out/ --output ./ --compact true --self-defending false && javascript-obfuscator ./server/out/ --output ./ --compact true --self-defending false"
+```
+
+Both `extension.js` and `server.js` are:
+- **Single-line files** (all code on one line)
+- Processed by `javascript-obfuscator` with `--compact true`
+- Variable names replaced with hex identifiers (e.g., `_0x216cd2`, `a0_0x53cf`)
+- String literals extracted into a shuffled lookup table (7,979 entries in `extension.js`, 1,269 in `server.js`)
+- Control flow flattened with `while(!![]){try{...}catch{...}}` patterns
+
+This makes **manual security audit extremely difficult**.
+
+#### Security-Sensitive Patterns Found in Obfuscated Code
+
+| Pattern | `extension.js` | `server.js` | Assessment |
+|---|---|---|---|
+| `child_process` | 1 | 1 | **Expected** — LSP client spawns server process |
+| `spawn` | 3 | 1 | **Expected** — used to start the language server |
+| `exec` | 2 | 1 | **Likely SKILL docs** — `rexExecute`, `pcreExecute` are SKILL functions |
+| `fetch` | 4 | 0 | **Unclear** — could be VSCode API or network fetch |
+| `telemetry` | 2 | 4 | **Likely LSP standard** — `TelemetryEventNotification` is an LSP protocol type, `_telemetryEmitter` suggests event emitter pattern |
+| `sendRequest` | 18 | 11 | **Expected** — LSP protocol communication between client and server |
+| `crypto` | 1 | 1 | **Low risk** — likely used for ID generation |
+| `postMessage` | 1 | 1 | **Expected** — IPC communication |
+| `socket` | present | present | **Expected** — LSP transport option |
+
+#### External Endpoints
+
+**No hardcoded URLs or external domains were found** in either JavaScript file. The only domain-like strings found were `label.com`, `SemVer.com`, and `source.org` — all appear to be documentation references, not network endpoints.
+
+#### Assessment
+
+The obfuscated code **appears to be** a standard LSP client-server extension built with:
+- `vscode-languageclient` / `vscode-languageserver` (Microsoft's official LSP libraries)
+- Standard LSP protocol messages (completion, hover, diagnostics, definition, etc.)
+- Embedded SKILL function documentation (thousands of strings describing SKILL/Allegro/Framework II functions)
+
+**No evidence of malicious behavior was found**, but this assessment has significant limitations:
+1. The obfuscation makes it impossible to verify all code paths.
+2. String table analysis can miss dynamically constructed URLs or encoded payloads.
+3. Without the TypeScript source, we cannot confirm the code only does what LSP requires.
+
+#### Risk Rating for VSIX: HIGH
+
+While no active threats were identified, the combination of:
+- **Source code not published** (repo does not match VSIX)
+- **Intentional obfuscation** (javascript-obfuscator)
+- **No way to reproduce the build** (build toolchain not in repo)
+
+means the extension **cannot be fully trusted** through source code review alone. The publisher could introduce malicious code in a future update that would be extremely difficult to detect.
 
 ---
 
@@ -304,7 +396,7 @@ Since the extension has **no executable code** in this repository (no `main` ent
 - **No data is sent** to external servers by the extension code in this repo.
 - **No authentication tokens** are requested or stored.
 
-**CAVEAT:** This assessment applies only to the code in this repository. If the published VSIX contains additional JavaScript code not present here (see Section 2.1), that code could perform arbitrary network operations.
+**UPDATE (VSIX Audit):** The published VSIX **does** contain JavaScript code not in this repository (see Section 2.1.1). The obfuscated `extension.js` and `server.js` files were analyzed via string table extraction and pattern scanning. **No hardcoded external URLs or domains were found.** The `telemetry` references appear to be standard LSP protocol types (`TelemetryEventNotification`), not custom telemetry. However, due to obfuscation, this cannot be 100% confirmed.
 
 ### 3.2 Passive Data Exfiltration Vectors
 
@@ -350,23 +442,24 @@ If the published VSIX contains JavaScript code not present in this repo (see Sec
 - Log file paths, symbol names, and function signatures.
 - Write logs to VS Code's output channel or extension storage.
 
-**This cannot be assessed without examining the actual published VSIX.**
+**UPDATE (VSIX Audit):** The published VSIX was examined. The obfuscated code contains standard LSP logging patterns (output channels, trace notifications). No evidence of file-based logging or log exfiltration was found in the string tables. The `_telemetryEmitter` pattern suggests telemetry events are emitted within the LSP protocol (standard behavior) rather than sent to external endpoints. However, obfuscation prevents full verification.
 
 ---
 
 ## 5. Recommendations Summary
 
-| # | Priority | Action |
-|---|---|---|
-| 1 | **CRITICAL** | Obtain and decompile the published VSIX to verify it matches this repository. Audit any JavaScript code found in the VSIX that is not in this repo. |
-| 2 | **HIGH** | Create a `.vscodeignore` file to prevent `domain-knowledge/`, `.gitignore`, and non-essential files from shipping in the VSIX. |
-| 3 | **MEDIUM** | Fix the ReDoS-prone regex `(\w\|\-\|\!\|\?)*` in `skill.tmLanguage` — replace with character class `[\w\-!?]*`. |
-| 4 | **MEDIUM** | Test all regex patterns in `skill.tmLanguage` and `skill.configuration.json` with a ReDoS analysis tool. |
-| 5 | **MEDIUM** | For internal/enterprise deployment, fork the repo and replace external image URLs with bundled assets. |
-| 6 | **LOW** | Remove or customize the hardcoded "Author" snippet for internal use. |
-| 7 | **LOW** | Reconcile the version number in `package.json` (0.5.0) with the CHANGELOG (0.10.0). |
-| 8 | **LOW** | Document the provenance of bundled VS Code theme files (`dark_modern.json`, `dark_plus.json`, `dark_vs.json`). |
-| 9 | **LOW** | Fix the malformed contact URL in `README.md` (uses `http://` instead of `mailto:`). |
+| # | Priority | Action | Status |
+|---|---|---|---|
+| 1 | **CRITICAL** | Obtain and audit the published VSIX to verify it matches this repository. | **COMPLETED** — VSIX audited. Confirmed: code is absent from repo and intentionally obfuscated. No malicious patterns found, but full verification impossible. |
+| 2 | **CRITICAL** | Request publisher release TypeScript source code, or decide to fork/rebuild from scratch without obfuscation. | NEW — Required to achieve full trust. |
+| 3 | **HIGH** | Create a `.vscodeignore` file to prevent `domain-knowledge/`, `.gitignore`, and non-essential files from shipping in the VSIX. | Open |
+| 4 | **MEDIUM** | Fix the ReDoS-prone regex `(\w\|\-\|\!\|\?)*` in `skill.tmLanguage` — replace with character class `[\w\-!?]*`. | Open |
+| 5 | **MEDIUM** | Test all regex patterns in `skill.tmLanguage` and `skill.configuration.json` with a ReDoS analysis tool. | Open |
+| 6 | **MEDIUM** | For internal/enterprise deployment, fork the repo and replace external image URLs with bundled assets. | Open |
+| 7 | **LOW** | Remove or customize the hardcoded "Author" snippet for internal use. | Open |
+| 8 | **LOW** | Reconcile the version number in `package.json` (0.5.0) with the CHANGELOG (0.10.0). | Open |
+| 9 | **LOW** | Document the provenance of bundled VS Code theme files (`dark_modern.json`, `dark_plus.json`, `dark_vs.json`). | Open |
+| 10 | **LOW** | Fix the malformed contact URL in `README.md` (uses `http://` instead of `mailto:`). | Open |
 
 ---
 
@@ -391,13 +484,19 @@ If the published VSIX contains JavaScript code not present in this repo (see Sec
 | `.gitignore` | Git config | Only excludes `.vscode/`; no `.vscodeignore` |
 | `resources/icons/main.png` | Image asset | No issues |
 | `resources/images/*.gif, *.png` | Image assets | No issues (binary, not analyzed for steganography) |
+| **VSIX: `extension/package.json`** | **VSIX manifest** | **Reveals obfuscation build pipeline; version 0.10.0; has `main` entry point** |
+| **VSIX: `client/out/extension.js`** | **Obfuscated JS (1.6MB)** | **LSP client; 7,979 obfuscated strings; `child_process`, `spawn`, `telemetry` refs** |
+| **VSIX: `server/out/server.js`** | **Obfuscated JS (356KB)** | **LSP server; 1,269 obfuscated strings; `telemetry/event` refs** |
+| **VSIX: `client/package.json`** | **Client deps** | **Depends on `vscode-languageclient ^9.0.1`** |
+| **VSIX: `server/package.json`** | **Server deps** | **Depends on `vscode-languageserver ^9.0.1`** |
 
 ---
 
 ## 7. Scope & Limitations
 
-- This review covers **only the source code in this repository**.
-- The published VSIX on the VS Code Marketplace was **not** examined. The actual published extension may contain additional code.
+- This review covers the source code in this repository **and** the published VSIX (v0.10.0) downloaded from the VS Code Marketplace.
+- The VSIX JavaScript files are **obfuscated**, limiting the depth of code audit. String table extraction and pattern matching were used, but these cannot guarantee detection of all threats.
 - Binary assets (images) were not analyzed for steganographic content.
 - No dynamic analysis (runtime behavior testing) was performed.
 - The extension's interaction with other installed extensions was not assessed.
+- The TypeScript source code that produces the VSIX JavaScript was not available for review.
